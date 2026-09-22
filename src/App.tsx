@@ -39,9 +39,9 @@ function getHostname(url: string): string {
 
 // List of CORS proxies to try in order
 const CORS_PROXIES = [
-  (url: string) => `/api/fetch?url=${encodeURIComponent(url)}`,
   (url: string) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
   (url: string) => `https://corsproxy.io/?${encodeURIComponent(url)}`,
+  (url: string) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
 ];
 
 // Fetch HTML through proxy, trying multiple services
@@ -49,16 +49,23 @@ async function fetchThroughProxy(url: string): Promise<string | null> {
   for (const proxyFn of CORS_PROXIES) {
     try {
       const proxyUrl = proxyFn(url);
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 10000);
+      
       const response = await fetch(proxyUrl, {
-        signal: AbortSignal.timeout(10000),
+        signal: controller.signal,
       });
+      
+      clearTimeout(timeoutId);
+      
       if (response.ok) {
         const text = await response.text();
         if (text && text.length > 100) {
           return text;
         }
       }
-    } catch {
+    } catch (error) {
+      console.warn('Proxy failed:', error);
       continue;
     }
   }
@@ -122,7 +129,7 @@ function cleanHtmlForIframe(html: string, originalUrl: string): string {
   `;
   cleaned = cleaned.replace('</head>', `${styles}</head>`);
 
-  // Script to open links in new tab and prevent frame-busting
+  // Script to open links in new tab
   const script = `
     <script>
       document.addEventListener('click', function(e) {
@@ -635,7 +642,6 @@ export default function App() {
                     setContentLoading(true);
                     setContentHtml(null);
                     setContentError(false);
-                    // Re-trigger the effect by toggling selectedSong
                     setSelectedSong({ ...selectedSong });
                   }}
                   className="btn-secondary text-sm px-3 py-2 flex-1 sm:flex-none"
@@ -732,7 +738,6 @@ export default function App() {
               <p className="text-xs text-gray-500">
                 Содержимое загружается через прокси-сервер. Если текст не отображается, 
                 используйте кнопку «↗ Оригинал» для открытия страницы напрямую.
-                При деплое на Vercel используется встроенный серверный прокси для максимальной совместимости.
               </p>
             </div>
           </div>
