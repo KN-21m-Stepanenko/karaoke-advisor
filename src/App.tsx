@@ -37,6 +37,11 @@ function getHostname(url: string): string {
   }
 }
 
+// Build proxy URL — uses local Vercel serverless function
+function getProxyUrl(url: string): string {
+  return `/api/fetch?url=${encodeURIComponent(url)}`;
+}
+
 export default function App() {
   const [songs, setSongs] = useState<Song[]>(loadSongs);
   const [view, setView] = useState<View>('list');
@@ -45,9 +50,12 @@ export default function App() {
   const [formData, setFormData] = useState({ artist: '', title: '', url: '' });
   const [formError, setFormError] = useState('');
   const [iframeError, setIframeError] = useState(false);
+  const [iframeLoading, setIframeLoading] = useState(true);
   const [showExport, setShowExport] = useState(false);
   const [importText, setImportText] = useState('');
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const iframeRef = useRef<HTMLIFrameElement>(null);
+  const loadAttempt = useRef(0);
 
   useEffect(() => {
     saveSongs(songs);
@@ -93,12 +101,16 @@ export default function App() {
     const idx = Math.floor(Math.random() * songs.length);
     setSelectedSong(songs[idx]);
     setIframeError(false);
+    setIframeLoading(true);
+    loadAttempt.current = 0;
     setView('view');
   }, [songs]);
 
   const handleSelectSong = useCallback((song: Song) => {
     setSelectedSong(song);
     setIframeError(false);
+    setIframeLoading(true);
+    loadAttempt.current = 0;
     setView('view');
   }, []);
 
@@ -109,6 +121,34 @@ export default function App() {
       setView('list');
     }
   }, [selectedSong]);
+
+  // Retry iframe loading with different strategies
+  const retryLoad = useCallback(() => {
+    if (!selectedSong) return;
+    loadAttempt.current += 1;
+    setIframeError(false);
+    setIframeLoading(true);
+    
+    // Force iframe reload
+    if (iframeRef.current) {
+      const src = loadAttempt.current % 2 === 0 
+        ? getProxyUrl(selectedSong.url) 
+        : selectedSong.url;
+      iframeRef.current.src = src;
+    }
+  }, [selectedSong]);
+
+  // Timeout for loading
+  useEffect(() => {
+    if (view === 'view' && selectedSong && iframeLoading && !iframeError) {
+      const timer = setTimeout(() => {
+        setIframeLoading(false);
+        // If still loading after 12 seconds, show error
+        setIframeError(true);
+      }, 12000);
+      return () => clearTimeout(timer);
+    }
+  }, [view, selectedSong, iframeLoading, iframeError]);
 
   const handleExport = useCallback(() => {
     const data = JSON.stringify(songs, null, 2);
@@ -211,9 +251,9 @@ export default function App() {
               onClick={() => setShowExport(!showExport)}
               className="px-2.5 sm:px-3 py-2 rounded-lg text-xs sm:text-sm font-medium transition-all"
               style={{
-                color: '#9ca3af',
-                backgroundColor: 'transparent',
-                border: '1px solid transparent',
+                color: showExport ? '#c4b5fd' : '#9ca3af',
+                backgroundColor: showExport ? 'rgba(147, 51, 234, 0.15)' : 'transparent',
+                border: showExport ? '1px solid rgba(147, 51, 234, 0.3)' : '1px solid transparent',
               }}
             >
               💾 <span className="hidden sm:inline">Данные</span>
@@ -287,7 +327,6 @@ export default function App() {
         {/* Song List View */}
         {view === 'list' && (
           <div className="space-y-4">
-            {/* Stats & Filter */}
             <div className="flex flex-col sm:flex-row gap-3 items-start sm:items-center justify-between">
               <div className="text-sm text-gray-400">
                 {songs.length === 0 ? (
@@ -325,7 +364,6 @@ export default function App() {
               )}
             </div>
 
-            {/* Empty State */}
             {songs.length === 0 && (
               <div className="glass-card p-10 sm:p-12 text-center">
                 <div className="text-5xl sm:text-6xl mb-4">🎵</div>
@@ -333,19 +371,14 @@ export default function App() {
                   Пока нет песен
                 </h2>
                 <p className="text-gray-500 mb-6 text-sm max-w-sm mx-auto">
-                  Добавляйте песни с аккордами и собирайте свою базу для караоке. 
-                  Ссылки на amdm.ru, acords.ru, guitar.ru и другие сайты.
+                  Добавляйте песни с аккордами и собирайте свою базу для караоке.
                 </p>
-                <button
-                  onClick={() => setView('add')}
-                  className="btn-primary"
-                >
+                <button onClick={() => setView('add')} className="btn-primary">
                   ➕ Добавить первую песню
                 </button>
               </div>
             )}
 
-            {/* Song Grid */}
             {filteredSongs.length > 0 && (
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
                 {filteredSongs.map((song) => (
@@ -386,17 +419,11 @@ export default function App() {
               </div>
             )}
 
-            {/* No results */}
             {songs.length > 0 && filteredSongs.length === 0 && (
               <div className="glass-card p-8 text-center">
                 <div className="text-4xl mb-3">🔍</div>
-                <p className="text-gray-400">
-                  Ничего не найдено по запросу «{filter}»
-                </p>
-                <button
-                  onClick={() => setFilter('')}
-                  className="btn-secondary text-sm mt-3"
-                >
+                <p className="text-gray-400">Ничего не найдено по запросу «{filter}»</p>
+                <button onClick={() => setFilter('')} className="btn-secondary text-sm mt-3">
                   Сбросить фильтр
                 </button>
               </div>
@@ -413,51 +440,39 @@ export default function App() {
               </h2>
               <div className="space-y-4">
                 <div>
-                  <label className="block text-sm font-medium text-gray-400 mb-1.5">
-                    Исполнитель
-                  </label>
+                  <label className="block text-sm font-medium text-gray-400 mb-1.5">Исполнитель</label>
                   <input
                     type="text"
                     value={formData.artist}
-                    onChange={(e) =>
-                      setFormData({ ...formData, artist: e.target.value })
-                    }
+                    onChange={(e) => setFormData({ ...formData, artist: e.target.value })}
                     placeholder="Например: Кино"
                     className="input-field"
                     onKeyDown={(e) => e.key === 'Enter' && handleAdd()}
                   />
                 </div>
                 <div>
-                  <label className="block text-sm font-medium text-gray-400 mb-1.5">
-                    Название песни
-                  </label>
+                  <label className="block text-sm font-medium text-gray-400 mb-1.5">Название песни</label>
                   <input
                     type="text"
                     value={formData.title}
-                    onChange={(e) =>
-                      setFormData({ ...formData, title: e.target.value })
-                    }
+                    onChange={(e) => setFormData({ ...formData, title: e.target.value })}
                     placeholder="Например: Звезда по имени Солнце"
                     className="input-field"
                     onKeyDown={(e) => e.key === 'Enter' && handleAdd()}
                   />
                 </div>
                 <div>
-                  <label className="block text-sm font-medium text-gray-400 mb-1.5">
-                    Ссылка на текст с аккордами
-                  </label>
+                  <label className="block text-sm font-medium text-gray-400 mb-1.5">Ссылка на текст с аккордами</label>
                   <input
                     type="url"
                     value={formData.url}
-                    onChange={(e) =>
-                      setFormData({ ...formData, url: e.target.value })
-                    }
+                    onChange={(e) => setFormData({ ...formData, url: e.target.value })}
                     placeholder="https://amdm.ru/akordi/kino/..."
                     className="input-field"
                     onKeyDown={(e) => e.key === 'Enter' && handleAdd()}
                   />
                   <p className="text-xs text-gray-600 mt-1.5">
-                    💡 Подойдут ссылки с amdm.ru, acords.ru, guitar.ru, 4pda.ru и других сайтов с текстами и аккордами
+                    💡 Подойдут ссылки с amdm.ru, mychords.net, acords.ru и других сайтов
                   </p>
                 </div>
 
@@ -468,15 +483,9 @@ export default function App() {
                 )}
 
                 <div className="flex gap-3 pt-2">
-                  <button onClick={handleAdd} className="btn-primary flex-1">
-                    💾 Сохранить
-                  </button>
+                  <button onClick={handleAdd} className="btn-primary flex-1">💾 Сохранить</button>
                   <button
-                    onClick={() => {
-                      setView('list');
-                      setFormData({ artist: '', title: '', url: '' });
-                      setFormError('');
-                    }}
+                    onClick={() => { setView('list'); setFormData({ artist: '', title: '', url: '' }); setFormError(''); }}
                     className="btn-secondary"
                   >
                     Отмена
@@ -493,62 +502,60 @@ export default function App() {
             {/* Song Info Bar */}
             <div className="glass-card p-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
               <div className="min-w-0">
-                <h2 className="text-lg font-bold text-gray-100 truncate">
-                  {selectedSong.title}
-                </h2>
-                <p className="text-sm text-gray-400 truncate">
-                  {selectedSong.artist}
-                </p>
+                <h2 className="text-lg font-bold text-gray-100 truncate">{selectedSong.title}</h2>
+                <p className="text-sm text-gray-400 truncate">{selectedSong.artist}</p>
               </div>
               <div className="flex items-center gap-2 shrink-0 w-full sm:w-auto">
+                <button onClick={retryLoad} className="btn-secondary text-sm px-3 py-2 flex-1 sm:flex-none">
+                  🔄 Обновить
+                </button>
                 <a
                   href={selectedSong.url}
                   target="_blank"
                   rel="noopener noreferrer"
                   className="btn-secondary text-sm px-3 py-2 flex-1 sm:flex-none text-center"
                 >
-                  ↗ Открыть
+                  ↗ Оригинал
                 </a>
-                <button
-                  onClick={() => setView('list')}
-                  className="btn-secondary text-sm px-3 py-2 flex-1 sm:flex-none"
-                >
+                <button onClick={() => setView('list')} className="btn-secondary text-sm px-3 py-2 flex-1 sm:flex-none">
                   ← Назад
                 </button>
               </div>
             </div>
 
-            {/* Iframe Content */}
-            <div className="glass-card overflow-hidden">
-              {!iframeError ? (
-                <div className="relative">
-                  <iframe
-                    src={selectedSong.url}
-                    title={`${selectedSong.title} - аккорды`}
-                    className="w-full border-0"
-                    style={{ height: '70vh' }}
-                    sandbox="allow-same-origin allow-scripts allow-popups"
-                    onError={() => setIframeError(true)}
-                  />
-                  <div className="absolute bottom-4 right-4">
-                    <a
-                      href={selectedSong.url}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="btn-primary text-xs px-3 py-1.5 inline-flex items-center gap-1"
-                    >
-                      ↗ Полная страница
-                    </a>
+            {/* Content Display */}
+            <div className="glass-card overflow-hidden relative" style={{ minHeight: '70vh' }}>
+              {/* Loading overlay */}
+              {iframeLoading && !iframeError && (
+                <div className="absolute inset-0 flex items-center justify-center z-10" style={{ backgroundColor: 'rgba(3, 7, 18, 0.85)' }}>
+                  <div className="text-center">
+                    <div className="inline-block animate-spin text-4xl mb-3">🎵</div>
+                    <p className="text-gray-400 text-sm">Загрузка текста...</p>
+                    <p className="text-gray-600 text-xs mt-1">{getHostname(selectedSong.url)}</p>
                   </div>
                 </div>
+              )}
+
+              {/* Iframe with proxy */}
+              {!iframeError ? (
+                <iframe
+                  ref={iframeRef}
+                  src={getProxyUrl(selectedSong.url)}
+                  title={`${selectedSong.title} - аккорды`}
+                  className="w-full border-0"
+                  style={{ height: '70vh' }}
+                  onLoad={() => setIframeLoading(false)}
+                  onError={() => { setIframeLoading(false); setIframeError(true); }}
+                  sandbox="allow-same-origin allow-scripts allow-popups allow-forms"
+                />
               ) : (
-                <div className="p-8 text-center">
+                <div className="p-8 text-center" style={{ minHeight: '50vh', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' }}>
                   <div className="text-5xl mb-4">🔒</div>
                   <h3 className="text-lg font-semibold text-gray-300 mb-2">
-                    Страница недоступна для встраивания
+                    Не удалось загрузить содержимое
                   </h3>
                   <p className="text-gray-500 mb-4 text-sm max-w-md mx-auto">
-                    Сайт заблокировал отображение во фрейме. Откройте ссылку в новой вкладке для просмотра текста с аккордами.
+                    Сайт блокирует доступ. Откройте ссылку напрямую.
                   </p>
                   <div className="flex flex-col sm:flex-row gap-3 justify-center">
                     <a
@@ -557,17 +564,23 @@ export default function App() {
                       rel="noopener noreferrer"
                       className="btn-primary inline-block"
                     >
-                      ↗ Открыть в новой вкладке
+                      ↗ Открыть оригинал
                     </a>
-                    <button
-                      onClick={() => setIframeError(false)}
-                      className="btn-secondary"
-                    >
+                    <button onClick={retryLoad} className="btn-secondary">
                       🔄 Попробовать снова
                     </button>
                   </div>
                 </div>
               )}
+            </div>
+
+            {/* Info */}
+            <div className="glass-card p-3 flex items-start gap-2">
+              <span className="text-sm">ℹ️</span>
+              <p className="text-xs text-gray-500">
+                Содержимое загружается через серверный прокси. При деплое на Vercel прокси работает автоматически. 
+                Если текст не отображается — используйте «↗ Оригинал».
+              </p>
             </div>
           </div>
         )}
@@ -576,9 +589,7 @@ export default function App() {
       {/* Footer */}
       <footer className="border-t border-gray-800/50 py-4 mt-auto">
         <div className="max-w-5xl mx-auto px-4 flex flex-col sm:flex-row items-center justify-between gap-2">
-          <p className="text-xs text-gray-600">
-            🎤 Караоке База • Данные хранятся локально в вашем браузере
-          </p>
+          <p className="text-xs text-gray-600">🎤 Караоке База • Данные хранятся локально</p>
           <p className="text-xs text-gray-700">
             {songs.length} {songs.length === 1 ? 'песня' : songs.length < 5 ? 'песни' : 'песен'} в коллекции
           </p>
