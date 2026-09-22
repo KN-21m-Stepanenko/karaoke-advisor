@@ -37,6 +37,108 @@ function getHostname(url: string): string {
   }
 }
 
+// List of CORS proxies to try in order
+const CORS_PROXIES = [
+  (url: string) => `/api/fetch?url=${encodeURIComponent(url)}`,
+  (url: string) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+  (url: string) => `https://corsproxy.io/?${encodeURIComponent(url)}`,
+];
+
+// Fetch HTML through proxy, trying multiple services
+async function fetchThroughProxy(url: string): Promise<string | null> {
+  for (const proxyFn of CORS_PROXIES) {
+    try {
+      const proxyUrl = proxyFn(url);
+      const response = await fetch(proxyUrl, {
+        signal: AbortSignal.timeout(10000),
+      });
+      if (response.ok) {
+        const text = await response.text();
+        if (text && text.length > 100) {
+          return text;
+        }
+      }
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
+// Clean HTML for display in iframe
+function cleanHtmlForIframe(html: string, originalUrl: string): string {
+  let cleaned = html;
+  
+  // Remove framing restrictions
+  cleaned = cleaned
+    .replace(/<meta[^>]*http-equiv\s*=\s*["']X-Frame-Options["'][^>]*>/gi, '')
+    .replace(/<meta[^>]*http-equiv\s*=\s*["']Content-Security-Policy["'][^>]*>/gi, '')
+    .replace(/frame-ancestors\s+[^;]*/gi, '');
+
+  // Parse URL for base
+  let baseUrl: string;
+  try {
+    const parsed = new URL(originalUrl);
+    baseUrl = `${parsed.origin}${parsed.pathname.replace(/[^/]*$/, '')}`;
+  } catch {
+    baseUrl = originalUrl;
+  }
+
+  // Inject base tag
+  const baseTag = `<base href="${baseUrl}" target="_blank">`;
+  if (cleaned.includes('<head>')) {
+    cleaned = cleaned.replace('<head>', `<head>${baseTag}`);
+  } else if (/<head\s[^>]*>/.test(cleaned)) {
+    cleaned = cleaned.replace(/<head\s[^>]*>/, (m) => `${m}${baseTag}`);
+  } else {
+    cleaned = `<head>${baseTag}</head>${cleaned}`;
+  }
+
+  // Add dark theme styles
+  const styles = `
+    <style>
+      body { 
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif !important;
+        line-height: 1.6 !important;
+        color: #e5e7eb !important;
+        background: #111827 !important;
+        padding: 1rem !important;
+        margin: 0 !important;
+      }
+      a { color: #a78bfa !important; text-decoration: underline !important; }
+      a:hover { color: #c4b5fd !important; }
+      pre, code { 
+        background: #1f2937 !important; 
+        color: #f3f4f6 !important;
+        border-radius: 0.5rem !important;
+        padding: 0.5rem !important;
+        font-size: 0.9rem !important;
+      }
+      img { max-width: 100% !important; height: auto !important; }
+      h1, h2, h3, h4 { color: #f3f4f6 !important; }
+      table { border-collapse: collapse !important; width: 100% !important; }
+      td, th { padding: 4px 8px !important; border: 1px solid #374151 !important; }
+    </style>
+  `;
+  cleaned = cleaned.replace('</head>', `${styles}</head>`);
+
+  // Script to open links in new tab and prevent frame-busting
+  const script = `
+    <script>
+      document.addEventListener('click', function(e) {
+        var a = e.target.closest('a');
+        if (a && a.href) {
+          e.preventDefault();
+          window.open(a.href, '_blank', 'noopener,noreferrer');
+        }
+      });
+    </script>
+  `;
+  cleaned = cleaned.replace('</body>', `${script}</body>`);
+
+  return cleaned;
+}
+
 export default function App() {
   const [songs, setSongs] = useState<Song[]>(loadSongs);
   const [view, setView] = useState<View>('list');
@@ -44,7 +146,9 @@ export default function App() {
   const [selectedSong, setSelectedSong] = useState<Song | null>(null);
   const [formData, setFormData] = useState({ artist: '', title: '', url: '' });
   const [formError, setFormError] = useState('');
-  const [iframeError, setIframeError] = useState(false);
+  const [contentLoading, setContentLoading] = useState(false);
+  const [contentHtml, setContentHtml] = useState<string | null>(null);
+  const [contentError, setContentError] = useState(false);
   const [showExport, setShowExport] = useState(false);
   const [importText, setImportText] = useState('');
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -92,13 +196,11 @@ export default function App() {
     if (songs.length === 0) return;
     const idx = Math.floor(Math.random() * songs.length);
     setSelectedSong(songs[idx]);
-    setIframeError(false);
     setView('view');
   }, [songs]);
 
   const handleSelectSong = useCallback((song: Song) => {
     setSelectedSong(song);
-    setIframeError(false);
     setView('view');
   }, []);
 
@@ -109,6 +211,33 @@ export default function App() {
       setView('list');
     }
   }, [selectedSong]);
+
+  // Load content when viewing a song
+  useEffect(() => {
+    if (view !== 'view' || !selectedSong) return;
+
+    let cancelled = false;
+    setContentLoading(true);
+    setContentHtml(null);
+    setContentError(false);
+
+    fetchThroughProxy(selectedSong.url).then((html) => {
+      if (cancelled) return;
+      if (html) {
+        const cleaned = cleanHtmlForIframe(html, selectedSong.url);
+        setContentHtml(cleaned);
+      } else {
+        setContentError(true);
+      }
+      setContentLoading(false);
+    }).catch(() => {
+      if (cancelled) return;
+      setContentError(true);
+      setContentLoading(false);
+    });
+
+    return () => { cancelled = true; };
+  }, [view, selectedSong]);
 
   const handleExport = useCallback(() => {
     const data = JSON.stringify(songs, null, 2);
@@ -211,9 +340,9 @@ export default function App() {
               onClick={() => setShowExport(!showExport)}
               className="px-2.5 sm:px-3 py-2 rounded-lg text-xs sm:text-sm font-medium transition-all"
               style={{
-                color: '#9ca3af',
-                backgroundColor: 'transparent',
-                border: '1px solid transparent',
+                color: showExport ? '#c4b5fd' : '#9ca3af',
+                backgroundColor: showExport ? 'rgba(147, 51, 234, 0.15)' : 'transparent',
+                border: showExport ? '1px solid rgba(147, 51, 234, 0.3)' : '1px solid transparent',
               }}
             >
               💾 <span className="hidden sm:inline">Данные</span>
@@ -334,7 +463,7 @@ export default function App() {
                 </h2>
                 <p className="text-gray-500 mb-6 text-sm max-w-sm mx-auto">
                   Добавляйте песни с аккордами и собирайте свою базу для караоке. 
-                  Ссылки на amdm.ru, acords.ru, guitar.ru и другие сайты.
+                  Ссылки на amdm.ru, mychords.net, acords.ru и другие сайты.
                 </p>
                 <button
                   onClick={() => setView('add')}
@@ -457,7 +586,7 @@ export default function App() {
                     onKeyDown={(e) => e.key === 'Enter' && handleAdd()}
                   />
                   <p className="text-xs text-gray-600 mt-1.5">
-                    💡 Подойдут ссылки с amdm.ru, acords.ru, guitar.ru, 4pda.ru и других сайтов с текстами и аккордами
+                    💡 Подойдут ссылки с amdm.ru, mychords.net, acords.ru, guitar.ru и других сайтов
                   </p>
                 </div>
 
@@ -501,13 +630,25 @@ export default function App() {
                 </p>
               </div>
               <div className="flex items-center gap-2 shrink-0 w-full sm:w-auto">
+                <button
+                  onClick={() => {
+                    setContentLoading(true);
+                    setContentHtml(null);
+                    setContentError(false);
+                    // Re-trigger the effect by toggling selectedSong
+                    setSelectedSong({ ...selectedSong });
+                  }}
+                  className="btn-secondary text-sm px-3 py-2 flex-1 sm:flex-none"
+                >
+                  🔄 Обновить
+                </button>
                 <a
                   href={selectedSong.url}
                   target="_blank"
                   rel="noopener noreferrer"
                   className="btn-secondary text-sm px-3 py-2 flex-1 sm:flex-none text-center"
                 >
-                  ↗ Открыть
+                  ↗ Оригинал
                 </a>
                 <button
                   onClick={() => setView('list')}
@@ -518,37 +659,47 @@ export default function App() {
               </div>
             </div>
 
-            {/* Iframe Content */}
-            <div className="glass-card overflow-hidden">
-              {!iframeError ? (
-                <div className="relative">
-                  <iframe
-                    src={selectedSong.url}
-                    title={`${selectedSong.title} - аккорды`}
-                    className="w-full border-0"
-                    style={{ height: '70vh' }}
-                    sandbox="allow-same-origin allow-scripts allow-popups"
-                    onError={() => setIframeError(true)}
-                  />
-                  <div className="absolute bottom-4 right-4">
-                    <a
-                      href={selectedSong.url}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="btn-primary text-xs px-3 py-1.5 inline-flex items-center gap-1"
-                    >
-                      ↗ Полная страница
-                    </a>
+            {/* Content Display */}
+            <div className="glass-card overflow-hidden relative" style={{ minHeight: '70vh' }}>
+              {/* Loading */}
+              {contentLoading && (
+                <div className="absolute inset-0 flex items-center justify-center z-10" style={{ backgroundColor: 'rgba(3, 7, 18, 0.9)' }}>
+                  <div className="text-center">
+                    <div className="inline-block animate-spin text-4xl mb-3">🎵</div>
+                    <p className="text-gray-400 text-sm">Загрузка текста с аккордами...</p>
+                    <p className="text-gray-600 text-xs mt-1">{getHostname(selectedSong.url)}</p>
+                    <div className="mt-3 flex items-center justify-center gap-1">
+                      <div className="w-2 h-2 rounded-full bg-purple-500 animate-bounce" style={{ animationDelay: '0ms' }}></div>
+                      <div className="w-2 h-2 rounded-full bg-purple-500 animate-bounce" style={{ animationDelay: '150ms' }}></div>
+                      <div className="w-2 h-2 rounded-full bg-purple-500 animate-bounce" style={{ animationDelay: '300ms' }}></div>
+                    </div>
                   </div>
                 </div>
-              ) : (
-                <div className="p-8 text-center">
+              )}
+
+              {/* Content via srcdoc */}
+              {contentHtml && !contentLoading && (
+                <iframe
+                  srcDoc={contentHtml}
+                  title={`${selectedSong.title} - аккорды`}
+                  className="w-full border-0"
+                  style={{ height: '70vh' }}
+                  sandbox="allow-same-origin allow-popups"
+                />
+              )}
+
+              {/* Error / Fallback */}
+              {contentError && !contentLoading && (
+                <div className="p-8 text-center" style={{ minHeight: '50vh', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' }}>
                   <div className="text-5xl mb-4">🔒</div>
                   <h3 className="text-lg font-semibold text-gray-300 mb-2">
-                    Страница недоступна для встраивания
+                    Не удалось загрузить содержимое
                   </h3>
-                  <p className="text-gray-500 mb-4 text-sm max-w-md mx-auto">
-                    Сайт заблокировал отображение во фрейме. Откройте ссылку в новой вкладке для просмотра текста с аккордами.
+                  <p className="text-gray-500 mb-2 text-sm max-w-md mx-auto">
+                    Сайт блокирует доступ к содержимому через прокси.
+                  </p>
+                  <p className="text-gray-600 mb-4 text-xs max-w-md mx-auto">
+                    Это может быть связано с защитой сайта. Откройте ссылку напрямую для просмотра текста с аккордами.
                   </p>
                   <div className="flex flex-col sm:flex-row gap-3 justify-center">
                     <a
@@ -557,10 +708,15 @@ export default function App() {
                       rel="noopener noreferrer"
                       className="btn-primary inline-block"
                     >
-                      ↗ Открыть в новой вкладке
+                      ↗ Открыть оригинал
                     </a>
                     <button
-                      onClick={() => setIframeError(false)}
+                      onClick={() => {
+                        setContentLoading(true);
+                        setContentHtml(null);
+                        setContentError(false);
+                        setSelectedSong({ ...selectedSong });
+                      }}
                       className="btn-secondary"
                     >
                       🔄 Попробовать снова
@@ -568,6 +724,16 @@ export default function App() {
                   </div>
                 </div>
               )}
+            </div>
+
+            {/* Info note */}
+            <div className="glass-card p-3 flex items-start gap-2">
+              <span className="text-sm">ℹ️</span>
+              <p className="text-xs text-gray-500">
+                Содержимое загружается через прокси-сервер. Если текст не отображается, 
+                используйте кнопку «↗ Оригинал» для открытия страницы напрямую.
+                При деплое на Vercel используется встроенный серверный прокси для максимальной совместимости.
+              </p>
             </div>
           </div>
         )}
