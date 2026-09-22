@@ -37,113 +37,9 @@ function getHostname(url: string): string {
   }
 }
 
-// List of CORS proxies to try in order
-const CORS_PROXIES = [
-  (url: string) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
-  (url: string) => `https://corsproxy.io/?${encodeURIComponent(url)}`,
-  (url: string) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
-];
-
-// Fetch HTML through proxy, trying multiple services
-async function fetchThroughProxy(url: string): Promise<string | null> {
-  for (const proxyFn of CORS_PROXIES) {
-    try {
-      const proxyUrl = proxyFn(url);
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 10000);
-      
-      const response = await fetch(proxyUrl, {
-        signal: controller.signal,
-      });
-      
-      clearTimeout(timeoutId);
-      
-      if (response.ok) {
-        const text = await response.text();
-        if (text && text.length > 100) {
-          return text;
-        }
-      }
-    } catch (error) {
-      console.warn('Proxy failed:', error);
-      continue;
-    }
-  }
-  return null;
-}
-
-// Clean HTML for display in iframe
-function cleanHtmlForIframe(html: string, originalUrl: string): string {
-  let cleaned = html;
-  
-  // Remove framing restrictions
-  cleaned = cleaned
-    .replace(/<meta[^>]*http-equiv\s*=\s*["']X-Frame-Options["'][^>]*>/gi, '')
-    .replace(/<meta[^>]*http-equiv\s*=\s*["']Content-Security-Policy["'][^>]*>/gi, '')
-    .replace(/frame-ancestors\s+[^;]*/gi, '');
-
-  // Parse URL for base
-  let baseUrl: string;
-  try {
-    const parsed = new URL(originalUrl);
-    baseUrl = `${parsed.origin}${parsed.pathname.replace(/[^/]*$/, '')}`;
-  } catch {
-    baseUrl = originalUrl;
-  }
-
-  // Inject base tag
-  const baseTag = `<base href="${baseUrl}" target="_blank">`;
-  if (cleaned.includes('<head>')) {
-    cleaned = cleaned.replace('<head>', `<head>${baseTag}`);
-  } else if (/<head\s[^>]*>/.test(cleaned)) {
-    cleaned = cleaned.replace(/<head\s[^>]*>/, (m) => `${m}${baseTag}`);
-  } else {
-    cleaned = `<head>${baseTag}</head>${cleaned}`;
-  }
-
-  // Add dark theme styles
-  const styles = `
-    <style>
-      body { 
-        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif !important;
-        line-height: 1.6 !important;
-        color: #e5e7eb !important;
-        background: #111827 !important;
-        padding: 1rem !important;
-        margin: 0 !important;
-      }
-      a { color: #a78bfa !important; text-decoration: underline !important; }
-      a:hover { color: #c4b5fd !important; }
-      pre, code { 
-        background: #1f2937 !important; 
-        color: #f3f4f6 !important;
-        border-radius: 0.5rem !important;
-        padding: 0.5rem !important;
-        font-size: 0.9rem !important;
-      }
-      img { max-width: 100% !important; height: auto !important; }
-      h1, h2, h3, h4 { color: #f3f4f6 !important; }
-      table { border-collapse: collapse !important; width: 100% !important; }
-      td, th { padding: 4px 8px !important; border: 1px solid #374151 !important; }
-    </style>
-  `;
-  cleaned = cleaned.replace('</head>', `${styles}</head>`);
-
-  // Script to open links in new tab
-  const script = `
-    <script>
-      document.addEventListener('click', function(e) {
-        var a = e.target.closest('a');
-        if (a && a.href) {
-          e.preventDefault();
-          window.open(a.href, '_blank', 'noopener,noreferrer');
-        }
-      });
-    </script>
-  `;
-  cleaned = cleaned.replace('</body>', `${script}</body>`);
-
-  return cleaned;
+// Build proxy URL — uses local Vercel serverless function
+function getProxyUrl(url: string): string {
+  return `/api/fetch?url=${encodeURIComponent(url)}`;
 }
 
 export default function App() {
@@ -153,12 +49,13 @@ export default function App() {
   const [selectedSong, setSelectedSong] = useState<Song | null>(null);
   const [formData, setFormData] = useState({ artist: '', title: '', url: '' });
   const [formError, setFormError] = useState('');
-  const [contentLoading, setContentLoading] = useState(false);
-  const [contentHtml, setContentHtml] = useState<string | null>(null);
-  const [contentError, setContentError] = useState(false);
+  const [iframeError, setIframeError] = useState(false);
+  const [iframeLoading, setIframeLoading] = useState(true);
   const [showExport, setShowExport] = useState(false);
   const [importText, setImportText] = useState('');
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const iframeRef = useRef<HTMLIFrameElement>(null);
+  const loadAttempt = useRef(0);
 
   useEffect(() => {
     saveSongs(songs);
@@ -203,11 +100,17 @@ export default function App() {
     if (songs.length === 0) return;
     const idx = Math.floor(Math.random() * songs.length);
     setSelectedSong(songs[idx]);
+    setIframeError(false);
+    setIframeLoading(true);
+    loadAttempt.current = 0;
     setView('view');
   }, [songs]);
 
   const handleSelectSong = useCallback((song: Song) => {
     setSelectedSong(song);
+    setIframeError(false);
+    setIframeLoading(true);
+    loadAttempt.current = 0;
     setView('view');
   }, []);
 
@@ -219,32 +122,33 @@ export default function App() {
     }
   }, [selectedSong]);
 
-  // Load content when viewing a song
+  // Retry iframe loading with different strategies
+  const retryLoad = useCallback(() => {
+    if (!selectedSong) return;
+    loadAttempt.current += 1;
+    setIframeError(false);
+    setIframeLoading(true);
+    
+    // Force iframe reload
+    if (iframeRef.current) {
+      const src = loadAttempt.current % 2 === 0 
+        ? getProxyUrl(selectedSong.url) 
+        : selectedSong.url;
+      iframeRef.current.src = src;
+    }
+  }, [selectedSong]);
+
+  // Timeout for loading
   useEffect(() => {
-    if (view !== 'view' || !selectedSong) return;
-
-    let cancelled = false;
-    setContentLoading(true);
-    setContentHtml(null);
-    setContentError(false);
-
-    fetchThroughProxy(selectedSong.url).then((html) => {
-      if (cancelled) return;
-      if (html) {
-        const cleaned = cleanHtmlForIframe(html, selectedSong.url);
-        setContentHtml(cleaned);
-      } else {
-        setContentError(true);
-      }
-      setContentLoading(false);
-    }).catch(() => {
-      if (cancelled) return;
-      setContentError(true);
-      setContentLoading(false);
-    });
-
-    return () => { cancelled = true; };
-  }, [view, selectedSong]);
+    if (view === 'view' && selectedSong && iframeLoading && !iframeError) {
+      const timer = setTimeout(() => {
+        setIframeLoading(false);
+        // If still loading after 12 seconds, show error
+        setIframeError(true);
+      }, 12000);
+      return () => clearTimeout(timer);
+    }
+  }, [view, selectedSong, iframeLoading, iframeError]);
 
   const handleExport = useCallback(() => {
     const data = JSON.stringify(songs, null, 2);
@@ -423,7 +327,6 @@ export default function App() {
         {/* Song List View */}
         {view === 'list' && (
           <div className="space-y-4">
-            {/* Stats & Filter */}
             <div className="flex flex-col sm:flex-row gap-3 items-start sm:items-center justify-between">
               <div className="text-sm text-gray-400">
                 {songs.length === 0 ? (
@@ -461,7 +364,6 @@ export default function App() {
               )}
             </div>
 
-            {/* Empty State */}
             {songs.length === 0 && (
               <div className="glass-card p-10 sm:p-12 text-center">
                 <div className="text-5xl sm:text-6xl mb-4">🎵</div>
@@ -469,19 +371,14 @@ export default function App() {
                   Пока нет песен
                 </h2>
                 <p className="text-gray-500 mb-6 text-sm max-w-sm mx-auto">
-                  Добавляйте песни с аккордами и собирайте свою базу для караоке. 
-                  Ссылки на amdm.ru, mychords.net, acords.ru и другие сайты.
+                  Добавляйте песни с аккордами и собирайте свою базу для караоке.
                 </p>
-                <button
-                  onClick={() => setView('add')}
-                  className="btn-primary"
-                >
+                <button onClick={() => setView('add')} className="btn-primary">
                   ➕ Добавить первую песню
                 </button>
               </div>
             )}
 
-            {/* Song Grid */}
             {filteredSongs.length > 0 && (
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
                 {filteredSongs.map((song) => (
@@ -522,17 +419,11 @@ export default function App() {
               </div>
             )}
 
-            {/* No results */}
             {songs.length > 0 && filteredSongs.length === 0 && (
               <div className="glass-card p-8 text-center">
                 <div className="text-4xl mb-3">🔍</div>
-                <p className="text-gray-400">
-                  Ничего не найдено по запросу «{filter}»
-                </p>
-                <button
-                  onClick={() => setFilter('')}
-                  className="btn-secondary text-sm mt-3"
-                >
+                <p className="text-gray-400">Ничего не найдено по запросу «{filter}»</p>
+                <button onClick={() => setFilter('')} className="btn-secondary text-sm mt-3">
                   Сбросить фильтр
                 </button>
               </div>
@@ -549,51 +440,39 @@ export default function App() {
               </h2>
               <div className="space-y-4">
                 <div>
-                  <label className="block text-sm font-medium text-gray-400 mb-1.5">
-                    Исполнитель
-                  </label>
+                  <label className="block text-sm font-medium text-gray-400 mb-1.5">Исполнитель</label>
                   <input
                     type="text"
                     value={formData.artist}
-                    onChange={(e) =>
-                      setFormData({ ...formData, artist: e.target.value })
-                    }
+                    onChange={(e) => setFormData({ ...formData, artist: e.target.value })}
                     placeholder="Например: Кино"
                     className="input-field"
                     onKeyDown={(e) => e.key === 'Enter' && handleAdd()}
                   />
                 </div>
                 <div>
-                  <label className="block text-sm font-medium text-gray-400 mb-1.5">
-                    Название песни
-                  </label>
+                  <label className="block text-sm font-medium text-gray-400 mb-1.5">Название песни</label>
                   <input
                     type="text"
                     value={formData.title}
-                    onChange={(e) =>
-                      setFormData({ ...formData, title: e.target.value })
-                    }
+                    onChange={(e) => setFormData({ ...formData, title: e.target.value })}
                     placeholder="Например: Звезда по имени Солнце"
                     className="input-field"
                     onKeyDown={(e) => e.key === 'Enter' && handleAdd()}
                   />
                 </div>
                 <div>
-                  <label className="block text-sm font-medium text-gray-400 mb-1.5">
-                    Ссылка на текст с аккордами
-                  </label>
+                  <label className="block text-sm font-medium text-gray-400 mb-1.5">Ссылка на текст с аккордами</label>
                   <input
                     type="url"
                     value={formData.url}
-                    onChange={(e) =>
-                      setFormData({ ...formData, url: e.target.value })
-                    }
+                    onChange={(e) => setFormData({ ...formData, url: e.target.value })}
                     placeholder="https://amdm.ru/akordi/kino/..."
                     className="input-field"
                     onKeyDown={(e) => e.key === 'Enter' && handleAdd()}
                   />
                   <p className="text-xs text-gray-600 mt-1.5">
-                    💡 Подойдут ссылки с amdm.ru, mychords.net, acords.ru, guitar.ru и других сайтов
+                    💡 Подойдут ссылки с amdm.ru, mychords.net, acords.ru и других сайтов
                   </p>
                 </div>
 
@@ -604,15 +483,9 @@ export default function App() {
                 )}
 
                 <div className="flex gap-3 pt-2">
-                  <button onClick={handleAdd} className="btn-primary flex-1">
-                    💾 Сохранить
-                  </button>
+                  <button onClick={handleAdd} className="btn-primary flex-1">💾 Сохранить</button>
                   <button
-                    onClick={() => {
-                      setView('list');
-                      setFormData({ artist: '', title: '', url: '' });
-                      setFormError('');
-                    }}
+                    onClick={() => { setView('list'); setFormData({ artist: '', title: '', url: '' }); setFormError(''); }}
                     className="btn-secondary"
                   >
                     Отмена
@@ -629,23 +502,11 @@ export default function App() {
             {/* Song Info Bar */}
             <div className="glass-card p-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
               <div className="min-w-0">
-                <h2 className="text-lg font-bold text-gray-100 truncate">
-                  {selectedSong.title}
-                </h2>
-                <p className="text-sm text-gray-400 truncate">
-                  {selectedSong.artist}
-                </p>
+                <h2 className="text-lg font-bold text-gray-100 truncate">{selectedSong.title}</h2>
+                <p className="text-sm text-gray-400 truncate">{selectedSong.artist}</p>
               </div>
               <div className="flex items-center gap-2 shrink-0 w-full sm:w-auto">
-                <button
-                  onClick={() => {
-                    setContentLoading(true);
-                    setContentHtml(null);
-                    setContentError(false);
-                    setSelectedSong({ ...selectedSong });
-                  }}
-                  className="btn-secondary text-sm px-3 py-2 flex-1 sm:flex-none"
-                >
+                <button onClick={retryLoad} className="btn-secondary text-sm px-3 py-2 flex-1 sm:flex-none">
                   🔄 Обновить
                 </button>
                 <a
@@ -656,10 +517,7 @@ export default function App() {
                 >
                   ↗ Оригинал
                 </a>
-                <button
-                  onClick={() => setView('list')}
-                  className="btn-secondary text-sm px-3 py-2 flex-1 sm:flex-none"
-                >
+                <button onClick={() => setView('list')} className="btn-secondary text-sm px-3 py-2 flex-1 sm:flex-none">
                   ← Назад
                 </button>
               </div>
@@ -667,45 +525,37 @@ export default function App() {
 
             {/* Content Display */}
             <div className="glass-card overflow-hidden relative" style={{ minHeight: '70vh' }}>
-              {/* Loading */}
-              {contentLoading && (
-                <div className="absolute inset-0 flex items-center justify-center z-10" style={{ backgroundColor: 'rgba(3, 7, 18, 0.9)' }}>
+              {/* Loading overlay */}
+              {iframeLoading && !iframeError && (
+                <div className="absolute inset-0 flex items-center justify-center z-10" style={{ backgroundColor: 'rgba(3, 7, 18, 0.85)' }}>
                   <div className="text-center">
                     <div className="inline-block animate-spin text-4xl mb-3">🎵</div>
-                    <p className="text-gray-400 text-sm">Загрузка текста с аккордами...</p>
+                    <p className="text-gray-400 text-sm">Загрузка текста...</p>
                     <p className="text-gray-600 text-xs mt-1">{getHostname(selectedSong.url)}</p>
-                    <div className="mt-3 flex items-center justify-center gap-1">
-                      <div className="w-2 h-2 rounded-full bg-purple-500 animate-bounce" style={{ animationDelay: '0ms' }}></div>
-                      <div className="w-2 h-2 rounded-full bg-purple-500 animate-bounce" style={{ animationDelay: '150ms' }}></div>
-                      <div className="w-2 h-2 rounded-full bg-purple-500 animate-bounce" style={{ animationDelay: '300ms' }}></div>
-                    </div>
                   </div>
                 </div>
               )}
 
-              {/* Content via srcdoc */}
-              {contentHtml && !contentLoading && (
+              {/* Iframe with proxy */}
+              {!iframeError ? (
                 <iframe
-                  srcDoc={contentHtml}
+                  ref={iframeRef}
+                  src={getProxyUrl(selectedSong.url)}
                   title={`${selectedSong.title} - аккорды`}
                   className="w-full border-0"
                   style={{ height: '70vh' }}
-                  sandbox="allow-same-origin allow-popups"
+                  onLoad={() => setIframeLoading(false)}
+                  onError={() => { setIframeLoading(false); setIframeError(true); }}
+                  sandbox="allow-same-origin allow-scripts allow-popups allow-forms"
                 />
-              )}
-
-              {/* Error / Fallback */}
-              {contentError && !contentLoading && (
+              ) : (
                 <div className="p-8 text-center" style={{ minHeight: '50vh', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' }}>
                   <div className="text-5xl mb-4">🔒</div>
                   <h3 className="text-lg font-semibold text-gray-300 mb-2">
                     Не удалось загрузить содержимое
                   </h3>
-                  <p className="text-gray-500 mb-2 text-sm max-w-md mx-auto">
-                    Сайт блокирует доступ к содержимому через прокси.
-                  </p>
-                  <p className="text-gray-600 mb-4 text-xs max-w-md mx-auto">
-                    Это может быть связано с защитой сайта. Откройте ссылку напрямую для просмотра текста с аккордами.
+                  <p className="text-gray-500 mb-4 text-sm max-w-md mx-auto">
+                    Сайт блокирует доступ. Откройте ссылку напрямую.
                   </p>
                   <div className="flex flex-col sm:flex-row gap-3 justify-center">
                     <a
@@ -716,15 +566,7 @@ export default function App() {
                     >
                       ↗ Открыть оригинал
                     </a>
-                    <button
-                      onClick={() => {
-                        setContentLoading(true);
-                        setContentHtml(null);
-                        setContentError(false);
-                        setSelectedSong({ ...selectedSong });
-                      }}
-                      className="btn-secondary"
-                    >
+                    <button onClick={retryLoad} className="btn-secondary">
                       🔄 Попробовать снова
                     </button>
                   </div>
@@ -732,12 +574,12 @@ export default function App() {
               )}
             </div>
 
-            {/* Info note */}
+            {/* Info */}
             <div className="glass-card p-3 flex items-start gap-2">
               <span className="text-sm">ℹ️</span>
               <p className="text-xs text-gray-500">
-                Содержимое загружается через прокси-сервер. Если текст не отображается, 
-                используйте кнопку «↗ Оригинал» для открытия страницы напрямую.
+                Содержимое загружается через серверный прокси. При деплое на Vercel прокси работает автоматически. 
+                Если текст не отображается — используйте «↗ Оригинал».
               </p>
             </div>
           </div>
@@ -747,9 +589,7 @@ export default function App() {
       {/* Footer */}
       <footer className="border-t border-gray-800/50 py-4 mt-auto">
         <div className="max-w-5xl mx-auto px-4 flex flex-col sm:flex-row items-center justify-between gap-2">
-          <p className="text-xs text-gray-600">
-            🎤 Караоке База • Данные хранятся локально в вашем браузере
-          </p>
+          <p className="text-xs text-gray-600">🎤 Караоке База • Данные хранятся локально</p>
           <p className="text-xs text-gray-700">
             {songs.length} {songs.length === 1 ? 'песня' : songs.length < 5 ? 'песни' : 'песен'} в коллекции
           </p>
